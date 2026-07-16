@@ -1,0 +1,11 @@
+{
+    "manifest_version": 3,
+    "name": "Writing Buddy",
+    "version": "1.0",
+    "description": "A Buddy that writes like you",
+    "permissions": ["tabs"],
+    "host_permissions": ["https://docs.google.com/*"]
+
+
+
+}
