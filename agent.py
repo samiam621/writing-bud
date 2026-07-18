@@ -30,15 +30,12 @@ Flow of one turn:
 from google import genai
 from google.genai import types
 
-# Pull the model name + key from config. Fallbacks let this file run alone.
-try:
-    import config
-    GENERATION_MODEL = config.GENERATION_MODEL
-    GEMINI_API_KEY = config.GEMINI_API_KEY
-except ImportError:
-    import os
-    GENERATION_MODEL = "gemini-1.5-flash"
-    GEMINI_API_KEY = os.environ.get("geminiAPI", "")
+# All settings (model name, API key) live in config.py — the single source of
+# truth. If config can't be imported, the app can't run, so we let that fail
+# loudly rather than limping along on a stale hardcoded model name.
+import config
+GENERATION_MODEL = config.GENERATION_MODEL
+GEMINI_API_KEY = config.GEMINI_API_KEY
 
 # The retrieval memory. This is the ONLY link to embeddings/FAISS, and it
 # speaks in plain strings — agent.py stays blissfully unaware of vectors.
@@ -193,5 +190,5 @@ if __name__ == "__main__":
         print("No sample.txt found — generating without style examples.\n")
 
     reply = generate("Write a short thank-you note to a mentor.")
-    print("--- AGENT REPLY ---")
+    print("--- BUDDY REPLY ---")
     print(reply)

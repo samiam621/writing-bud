@@ -31,7 +31,7 @@ load_dotenv()
 #     geminiAPI="your-key-here"
 #
 # The second argument to os.environ.get is a fallback ("") if it's not set.
-GEMINI_API_KEY = os.environ.get("geminiAPI", "")
+GEMINI_API_KEY = os.environ.get("geminiAPI") or os.environ.get("GEMINI_API_KEY", "")
 
 # Fail loudly and early if the key is missing, instead of getting a confusing
 # error later from deep inside the Gemini library.
@@ -41,14 +41,26 @@ if not GEMINI_API_KEY:
 # ---------------------------------------------------------------------------
 # MODELS  (which Gemini models to use for each job)
 # ---------------------------------------------------------------------------
-# Turns text into vectors. embeddings.py uses this. 004 returns 768-dim vectors,
-# which is the EMBED_DIM hardcoded in embeddings.py — keep them in sync.
+# Turns text into vectors. embeddings.py uses this.
+# NOTE: the old "text-embedding-004" model was retired from the Gemini API
+# (you'll get a 404 NOT_FOUND if you use it). "gemini-embedding-001" is the
+# current model. It defaults to 3072-dim vectors but supports 768/1536/3072
+# via output_dimensionality — we ask for 768 in embeddings.py to match EMBED_DIM.
 # (The new google-genai SDK takes the bare name, no "models/" prefix.)
-EMBED_MODEL = "text-embedding-004"
+EMBED_MODEL = "gemini-embedding-001"
+
+# Length of the vectors we request from EMBED_MODEL. Must match EMBED_DIM in
+# embeddings.py, which sizes the FAISS index. 768 keeps parity with the old
+# text-embedding-004 setup; valid values for gemini-embedding-001 are 768/1536/3072.
+EMBED_DIM = 768
 
 # Writes the actual responses. agent.py uses this. "flash" is fast and cheap;
-# swap to "gemini-1.5-pro" if you want higher-quality writing at more cost.
-GENERATION_MODEL = "gemini-1.5-flash"
+# swap to "gemini-3.5-pro" if you want higher-quality writing at more cost.
+# NOTE: older models get retired regularly — gemini-1.5-* and even the bare
+# gemini-2.5-flash alias now return 404 for newer API keys. gemini-3.5-flash is
+# the current fast/cheap generation model verified working on this key. To see
+# what your key can use, call client.models.list() and filter for generateContent.
+GENERATION_MODEL = "gemini-3.5-flash"
 
 # ---------------------------------------------------------------------------
 # STORAGE PATHS  (where the FAISS memory is saved on disk)

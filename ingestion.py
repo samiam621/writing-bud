@@ -36,15 +36,12 @@ So the handoff is exactly one line:
 import os
 import re
 
-# Tuning knobs live in config.py so you tweak them in one place.
-try:
-    import config
-    CHUNK_SIZE = config.CHUNK_SIZE        # characters per chunk
-    CHUNK_OVERLAP = config.CHUNK_OVERLAP  # characters shared between neighbors
-except ImportError:
-    # Fallback defaults so this file runs on its own while you build the others.
-    CHUNK_SIZE = 500
-    CHUNK_OVERLAP = 50
+# Tuning knobs live in config.py — the single source of truth — so you tweak
+# them in one place. If config can't be imported the app can't run, so we let
+# that fail loudly rather than fall back to values that could drift out of sync.
+import config
+CHUNK_SIZE = config.CHUNK_SIZE        # characters per chunk
+CHUNK_OVERLAP = config.CHUNK_OVERLAP  # characters shared between neighbors
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +68,6 @@ def read_file(path: str) -> str:
             return f.read()
 
     elif ext == ".pdf":
-        # PDFs need a library. Requires: pip install pypdf
         from pypdf import PdfReader
         reader = PdfReader(path)
         # Pull text out of each page and join with newlines.

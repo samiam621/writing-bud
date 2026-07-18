@@ -27,30 +27,25 @@ import faiss
 from google import genai
 from google.genai import types
 
-# We import settings from config.py so keys/models/paths live in ONE place.
-# (If you haven't written config.py yet, see the fallback defaults below.)
-try:
-    import config
-    GEMINI_API_KEY = config.GEMINI_API_KEY
-    EMBED_MODEL = config.EMBED_MODEL          # e.g. "models/text-embedding-004"
-    INDEX_PATH = config.INDEX_PATH            # where the FAISS index is saved
-    TEXTS_PATH = config.TEXTS_PATH            # where the chunk texts are saved
-    TOP_K = config.TOP_K                      # how many chunks to retrieve by default
-except ImportError:
-    # Fallback so this file can run on its own while you build the others.
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-    EMBED_MODEL = "models/text-embedding-004"
-    INDEX_PATH = "store/index.faiss"
-    TEXTS_PATH = "store/texts.json"
-    TOP_K = 4
+# All settings live in config.py — the single source of truth for keys, model
+# names, paths, and tuning knobs. If config can't be imported, this file can't
+# run correctly, so we let the import fail loudly rather than fall back to stale
+# defaults that could silently drift out of sync with config.
+import config
+GEMINI_API_KEY = config.GEMINI_API_KEY
+EMBED_MODEL = config.EMBED_MODEL          # e.g. "gemini-embedding-001"
+EMBED_DIM = config.EMBED_DIM              # vector length we request (must size the index)
+INDEX_PATH = config.INDEX_PATH            # where the FAISS index is saved
+TEXTS_PATH = config.TEXTS_PATH            # where the chunk texts are saved
+TOP_K = config.TOP_K                      # how many chunks to retrieve by default
 
 # In the new SDK you create ONE client object and reuse it, instead of a
 # global configure() call. It holds your key and talks to the API.
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# text-embedding-004 returns vectors of length 768. FAISS needs to know this
-# number up front so it can size the index correctly.
-EMBED_DIM = 768
+# FAISS needs the vector length up front to size the index correctly. EMBED_DIM
+# comes from config (or the fallback above) and MUST match the
+# output_dimensionality we request from Gemini in _embed().
 
 
 class StyleMemory:
@@ -94,10 +89,17 @@ class StyleMemory:
         # The new SDK embeds a whole LIST in one call (faster + fewer requests).
         # task_type="SEMANTIC_SIMILARITY" tells Gemini we're comparing texts for
         # likeness, which tunes the vectors for exactly our search use case.
+        # output_dimensionality asks gemini-embedding-001 for 768-dim vectors so
+        # they fit our FAISS index (its default is 3072). Note: for any size other
+        # than 3072 the API returns UN-normalized vectors — harmless for us since
+        # _normalize() rescales them to unit length right after.
         response = client.models.embed_content(
             model=EMBED_MODEL,
             contents=texts,
-            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+            config=types.EmbedContentConfig(
+                task_type="SEMANTIC_SIMILARITY",
+                output_dimensionality=EMBED_DIM,
+            ),
         )
 
         # response.embeddings is a list; each item has a .values attribute

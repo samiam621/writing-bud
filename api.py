@@ -34,7 +34,7 @@ from agent import generate
 
 # Create the application object. The title shows up in the auto-generated
 # docs at http://127.0.0.1:8000/docs — a free UI for testing your endpoints.
-app = FastAPI(title="Writing Agent API")
+app = FastAPI(title="Writing Buddy API")
 
 # ---------------------------------------------------------------------------
 # CORS — let the browser extension / other origins call this API
