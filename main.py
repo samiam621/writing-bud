@@ -13,18 +13,18 @@ this thin means "how do I start this thing?" always has an obvious answer.
 
 import uvicorn
 
-# Load the saved writing memory ONCE, at startup, before the server accepts
-# requests. Without this, the agent would forget every past upload each time
-# you restart. memory.load() quietly does nothing if there's no saved file yet.
-from embeddings import memory
-memory.load()
-print(f"Loaded memory: {memory.index.ntotal} chunks ready.")
-
+# NOTE: the saved writing memory is loaded by the lifespan hook in api.py,
+# which runs no matter HOW the server is started — `python main.py` here, or
+# `uvicorn api:app ...` on Render. (It used to be loaded in this file, which
+# silently skipped it in production because Render never runs main.py.)
 
 if __name__ == "__main__":
+    # DEVELOPMENT entry point only.
     # "api:app" tells uvicorn: import the `app` object from api.py.
-    # host 127.0.0.1 = local only (your machine). Change to "0.0.0.0" to expose
-    #   it on your network once you're ready.
-    # reload=True   = auto-restart when you edit a file. Great for development;
-    #   turn it off in production.
+    # host 127.0.0.1 = local only (your machine).
+    # reload=True   = auto-restart when you edit a file.
+    #
+    # In production (Render), don't use this file — set the start command to:
+    #     uvicorn api:app --host 0.0.0.0 --port $PORT
+    # (0.0.0.0 = accept outside connections; $PORT is assigned by Render.)
     uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)

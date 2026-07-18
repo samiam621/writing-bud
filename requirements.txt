@@ -1,11 +1,17 @@
+# Web layer
+fastapi
+uvicorn
+python-multipart
 
+# Gemini + retrieval
 google-genai
+faiss-cpu
+numpy
+
+# Config + validation
 python-dotenv
 pydantic
-sentence-transformers
-faiss-cpu
+
+# File parsing for /ingest
 pypdf
 python-docx
-google.generativeai
-
-
