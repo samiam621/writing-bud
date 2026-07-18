@@ -6,5 +6,6 @@ sentence-transformers
 faiss-cpu
 pypdf
 python-docx
+google.generativeai
 
 
