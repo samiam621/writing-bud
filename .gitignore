@@ -1,5 +1,5 @@
 .env
-.venv/
-.venv/
+.venv
+extensionFront/config.js
 __pycache__/
 store/
