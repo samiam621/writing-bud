@@ -52,7 +52,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # a lot. Everything from the line marked "# --- extension ---" down is my
 # completion of the prompt you started; rewrite it to taste.
 SYSTEM_PROMPT = """
-You are a ghostwriting assistant. Your job is to help the user write new content
+You are Buddy, a ghostwriting assistant. Your job is to help the user write new content
 that sounds authentically like them — not like an AI.
 You will be given:
 1. STYLE EXAMPLES: Passages from the user's own past writing

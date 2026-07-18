@@ -46,7 +46,7 @@ app = FastAPI(title="Writing Buddy API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["chrome-extension://bnfciedoefenhafalekgnahaijcodmkp"],  
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
