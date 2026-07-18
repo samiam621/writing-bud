@@ -23,7 +23,7 @@ load_dotenv()
 # SECRETS  (never hardcode these — read them from the environment)
 # ---------------------------------------------------------------------------
 # The string below MUST exactly match the variable name in your .env file.
-# Your .env uses `geminiAPI`, so we look up "geminiAPI" here. (Renaming it to
+# Your .env uses `GEMINI_API_KEY`, so we look up "GEMINI_API_KEY" here. (Renaming it to
 # GEMINI_API_KEY in .env and here is the tidier convention, but either works
 # as long as the two names match.)
 #
@@ -31,12 +31,59 @@ load_dotenv()
 #     geminiAPI="your-key-here"
 #
 # The second argument to os.environ.get is a fallback ("") if it's not set.
-GEMINI_API_KEY = os.environ.get("geminiAPI") or os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Fail loudly and early if the key is missing, instead of getting a confusing
 # error later from deep inside the Gemini library.
 if not GEMINI_API_KEY:
     print("WARNING: GEMINI_API_KEY is not set. Set it before making API calls.")
+
+# The shared secret clients must send in the X-API-Key header to use /ingest
+# and /chat. Generate one with:
+#     python -c "import secrets; print(secrets.token_urlsafe(32))"
+# and put it in .env (and in the extension's config.js). If this is unset the
+# API refuses all authenticated requests — fail CLOSED, never open.
+API_KEY = os.environ.get("WRITING_BUDDY_API_KEY", "")
+
+if not API_KEY:
+    print("WARNING: WRITING_BUDDY_API_KEY is not set. /ingest and /chat will reject all requests.")
+
+# ---------------------------------------------------------------------------
+# REQUEST LIMITS  (protect the server and the Gemini budget from abuse)
+# ---------------------------------------------------------------------------
+# Hard cap on upload size for /ingest. The endpoint streams the upload and
+# aborts as soon as this many bytes have arrived, so a huge POST can never
+# fill RAM (Render's free tier only gives the process 512MB).
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB — generous for a writing sample
+
+# Hard cap on /chat message length, enforced by Pydantic before our code runs.
+# Prompt cost scales with input size; this keeps one request's cost bounded.
+MAX_MESSAGE_CHARS = 4000
+
+# Simple per-IP rate limit shared by all endpoints: at most RATE_LIMIT_REQUESTS
+# requests per RATE_LIMIT_WINDOW_SECONDS from one client IP. Even with a valid
+# (or leaked) key, one client can't hammer the API in a tight loop.
+RATE_LIMIT_REQUESTS = 20
+RATE_LIMIT_WINDOW_SECONDS = 60
+
+# The only file types /ingest will accept. Checked BEFORE the upload is written
+# anywhere, so bytes of any other type never touch the disk. Must stay in sync
+# with what ingestion.read_file() can actually parse.
+ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".pdf", ".docx"}
+
+# Hard ceiling on how many chunks the FAISS index may ever hold. Two reasons:
+#   1. Memory: vectors live in RAM (768 floats * 4 bytes ≈ 3KB per chunk, plus
+#      the text itself) — unbounded uploads would eventually OOM the process.
+#   2. Speed: IndexFlatIP compares the query against EVERY stored vector, so
+#      search latency grows linearly with size.
+# 5000 chunks ≈ 2.5M characters of writing samples — plenty for one voice.
+MAX_TOTAL_CHUNKS = 5000
+
+# The owner label stamped on chunks when no specific user is known. There's a
+# single shared API key today, so everything is stored under this one owner —
+# but every chunk carries the column, so adding real per-user keys later is a
+# code change, not a data migration.
+DEFAULT_OWNER = "default"
 
 # ---------------------------------------------------------------------------
 # MODELS  (which Gemini models to use for each job)

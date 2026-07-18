@@ -38,6 +38,17 @@ EMBED_DIM = config.EMBED_DIM              # vector length we request (must size 
 INDEX_PATH = config.INDEX_PATH            # where the FAISS index is saved
 TEXTS_PATH = config.TEXTS_PATH            # where the chunk texts are saved
 TOP_K = config.TOP_K                      # how many chunks to retrieve by default
+MAX_TOTAL_CHUNKS = config.MAX_TOTAL_CHUNKS  # hard ceiling on index size
+DEFAULT_OWNER = config.DEFAULT_OWNER      # owner label while there's one shared key
+
+
+class MemoryFullError(Exception):
+    """
+    Raised by add_chunks when an upload would push the index past
+    MAX_TOTAL_CHUNKS. A dedicated exception (rather than a generic ValueError)
+    lets api.py turn exactly this case into a clear HTTP response without
+    accidentally swallowing real bugs.
+    """
 
 # In the new SDK you create ONE client object and reuse it, instead of a
 # global configure() call. It holds your key and talks to the API.
@@ -50,15 +61,24 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 class StyleMemory:
     """
-    Wraps the FAISS index PLUS the list of original chunk texts.
+    Wraps the FAISS index PLUS a parallel list of chunk records.
 
     Why both? FAISS only stores vectors and gives back integer positions
     (0, 1, 2, ...). It has NO idea what the original sentence was. So we keep
-    a plain Python list `self.texts` in the exact same order we added vectors.
-    Position 5 in the FAISS index  ==  self.texts[5].  That parallel list is
-    the bridge that turns a search result back into readable text.
+    a plain Python list `self.entries` in the exact same order we added
+    vectors. Position 5 in the FAISS index == self.entries[5]. That parallel
+    list is the bridge that turns a search result back into readable text.
 
-    Using a class keeps the index and the texts glued together, so they can
+    Each entry is a dict, not a bare string:
+        {"text": "...", "owner": "default", "source": "essay.pdf"}
+    The text is what search returns; owner/source are the "user column" the
+    index otherwise wouldn't have. With them, chunks stay attributable — you
+    can tell whose prose (and which upload) every vector came from, filter
+    search by owner, or delete one user's data later. Retrofitting this after
+    thousands of anonymous chunks exist is impossible, which is why the column
+    goes in now, while there's still only one user.
+
+    Using a class keeps the index and the entries glued together, so they can
     never drift out of sync.
     """
 
@@ -70,8 +90,8 @@ class StyleMemory:
         # accurate, perfect until you have tens of thousands of chunks.
         self.index = faiss.IndexFlatIP(EMBED_DIM)
 
-        # The parallel list of original chunk strings (the bridge described above).
-        self.texts: list[str] = []
+        # The parallel list of chunk records (the bridge described above).
+        self.entries: list[dict] = []
 
     # ---------- internal helpers (leading underscore = "private, don't call from outside") ----------
 
@@ -121,32 +141,49 @@ class StyleMemory:
 
     # ---------- public API: these are the functions other files call ----------
 
-    def add_chunks(self, chunks: list[str]) -> int:
+    def add_chunks(self, chunks: list[str], owner: str = DEFAULT_OWNER, source: str = "") -> int:
         """
         Store new writing samples.
 
-        Called by ingestion.py (or api.py) right after a file is chunked:
+        Called by api.py right after a file is chunked:
 
             chunks = ingestion.ingest("my_essay.txt")
-            memory.add_chunks(chunks)
+            memory.add_chunks(chunks, source="my_essay.txt")
+
+        `owner` tags whose writing this is (one shared owner today — see
+        config.DEFAULT_OWNER); `source` records which upload it came from.
 
         Steps:
+          0. Refuse if this would push the index past MAX_TOTAL_CHUNKS —
+             checked BEFORE embedding so a rejected upload costs zero API calls.
           1. Embed the chunks into vectors.
           2. Add those vectors to the FAISS index.
-          3. Append the original texts to self.texts IN THE SAME ORDER,
-             so positions stay aligned.
+          3. Append matching entry records IN THE SAME ORDER, so positions
+             stay aligned.
 
         Returns how many chunks were added (handy for a "stored 12 chunks" message).
         """
         if not chunks:
             return 0
 
+        # Step 0: capacity check. Without a ceiling, enough uploads exhaust
+        # RAM (every vector lives in memory) and slow every search (IndexFlatIP
+        # scans all vectors linearly).
+        if self.index.ntotal + len(chunks) > MAX_TOTAL_CHUNKS:
+            remaining = max(0, MAX_TOTAL_CHUNKS - self.index.ntotal)
+            raise MemoryFullError(
+                f"Memory is full: this file needs {len(chunks)} chunks but only "
+                f"{remaining} of {MAX_TOTAL_CHUNKS} slots remain."
+            )
+
         vectors = self._embed(chunks)   # step 1
         self.index.add(vectors)         # step 2
-        self.texts.extend(chunks)       # step 3
+        self.entries.extend(            # step 3
+            {"text": chunk, "owner": owner, "source": source} for chunk in chunks
+        )
         return len(chunks)
 
-    def search(self, query: str, k: int = TOP_K) -> list[str]:
+    def search(self, query: str, k: int = TOP_K, owner: str | None = None) -> list[str]:
         """
         Find the stored chunks most stylistically similar to `query`.
 
@@ -156,6 +193,10 @@ class StyleMemory:
             # ...then feed style_chunks to Gemini as style examples.
 
         Input:  a query string + how many results you want (defaults to TOP_K).
+                Pass `owner` to only get that owner's chunks back — the
+                guarantee that one person's prose can't leak into another's
+                voice once there's more than one owner. (With owner=None,
+                everything is searched — correct while there's a single user.)
         Output: a list of the matching ORIGINAL chunk strings (not vectors,
                 not numbers) — exactly what agent.py needs to build its prompt.
 
@@ -170,15 +211,30 @@ class StyleMemory:
         # the same vector space and are comparable. Note [query] -> a list.
         query_vector = self._embed([query])
 
+        # When filtering by owner, over-fetch: FAISS doesn't know about owners,
+        # so we grab every position ranked by similarity and keep the first k
+        # that belong to `owner`. Fine at IndexFlatIP scale (it scans everything
+        # anyway); revisit if the index type ever changes.
+        fetch = self.index.ntotal if owner is not None else k
+
         # FAISS returns two arrays:
         #   scores    = similarity score of each hit (higher = more similar)
-        #   positions = the index positions of each hit (this is what maps to self.texts)
-        scores, positions = self.index.search(query_vector, k)
+        #   positions = the index positions of each hit (maps into self.entries)
+        scores, positions = self.index.search(query_vector, fetch)
 
-        # positions is shaped (1, k) because we searched one query. Take row 0,
-        # then translate each position back into its original text via self.texts.
-        # (-1 can appear if fewer than k vectors exist; we skip those.)
-        results = [self.texts[i] for i in positions[0] if i != -1]
+        # positions is shaped (1, fetch) because we searched one query. Take
+        # row 0, then translate each position back into its entry record.
+        # (-1 can appear if fewer results exist than requested; we skip those.)
+        results = []
+        for i in positions[0]:
+            if i == -1:
+                continue
+            entry = self.entries[i]
+            if owner is not None and entry["owner"] != owner:
+                continue
+            results.append(entry["text"])
+            if len(results) == k:
+                break
         return results
 
     # ---------- persistence: so users don't re-upload every session ----------
@@ -189,14 +245,14 @@ class StyleMemory:
 
         Call this after add_chunks so the memory survives a restart. We save
         TWO things because the memory is two things: the FAISS vectors AND the
-        parallel text list. Saving one without the other would break the bridge.
+        parallel entry list. Saving one without the other would break the bridge.
         """
         # Make sure the folder exists (e.g. "store/") before writing into it.
         os.makedirs(os.path.dirname(INDEX_PATH), exist_ok=True)
 
         faiss.write_index(self.index, INDEX_PATH)              # the vectors
-        with open(TEXTS_PATH, "w", encoding="utf-8") as f:     # the texts
-            json.dump(self.texts, f, ensure_ascii=False, indent=2)
+        with open(TEXTS_PATH, "w", encoding="utf-8") as f:     # the entries
+            json.dump(self.entries, f, ensure_ascii=False, indent=2)
 
     def load(self) -> None:
         """
@@ -209,8 +265,17 @@ class StyleMemory:
         if os.path.exists(INDEX_PATH) and os.path.exists(TEXTS_PATH):
             self.index = faiss.read_index(INDEX_PATH)
             with open(TEXTS_PATH, "r", encoding="utf-8") as f:
-                self.texts = json.load(f)
-        # else: keep the fresh, empty index/texts created in __init__.
+                loaded = json.load(f)
+            # Migrate old saves: texts.json used to be a bare list of strings
+            # (no owner/source columns). Upgrade those to entry dicts on the
+            # fly; the next save() writes the new format and this branch never
+            # runs again for that file.
+            self.entries = [
+                item if isinstance(item, dict)
+                else {"text": item, "owner": DEFAULT_OWNER, "source": ""}
+                for item in loaded
+            ]
+        # else: keep the fresh, empty index/entries created in __init__.
 
 
 # A single shared instance the rest of the app imports and reuses.
