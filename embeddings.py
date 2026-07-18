@@ -24,15 +24,18 @@ import numpy as np
 import faiss
 # New official Gemini SDK. Install with: pip install google-genai
 # (The old `google.generativeai` package is deprecated.)
-from google import genai
 from google.genai import types
+
+# Client construction lives in gemini_client.py so a per-user key (BYOK) and
+# the server key go through the same cached factory. get_client() with no
+# argument returns the server-key client — the pre-BYOK behavior.
+from gemini_client import get_client
 
 # All settings live in config.py — the single source of truth for keys, model
 # names, paths, and tuning knobs. If config can't be imported, this file can't
 # run correctly, so we let the import fail loudly rather than fall back to stale
 # defaults that could silently drift out of sync with config.
 import config
-GEMINI_API_KEY = config.GEMINI_API_KEY
 EMBED_MODEL = config.EMBED_MODEL          # e.g. "gemini-embedding-001"
 EMBED_DIM = config.EMBED_DIM              # vector length we request (must size the index)
 INDEX_PATH = config.INDEX_PATH            # where the FAISS index is saved
@@ -49,10 +52,6 @@ class MemoryFullError(Exception):
     lets api.py turn exactly this case into a clear HTTP response without
     accidentally swallowing real bugs.
     """
-
-# In the new SDK you create ONE client object and reuse it, instead of a
-# global configure() call. It holds your key and talks to the API.
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 # FAISS needs the vector length up front to size the index correctly. EMBED_DIM
 # comes from config (or the fallback above) and MUST match the
@@ -95,12 +94,16 @@ class StyleMemory:
 
     # ---------- internal helpers (leading underscore = "private, don't call from outside") ----------
 
-    def _embed(self, texts: list[str]) -> np.ndarray:
+    def _embed(self, texts: list[str], client) -> np.ndarray:
         """
         Turn a list of strings into a matrix of vectors using Gemini.
 
-        Input:  ["some text", "more text"]
+        Input:  ["some text", "more text"] + the genai client to bill it to.
         Output: numpy array of shape (number_of_texts, 768), dtype float32.
+
+        The client is a required argument (not a module global) because with
+        BYOK the key — and therefore the client — can differ per request.
+        The public methods (add_chunks/search) resolve it and pass it down.
 
         FAISS specifically wants float32, so we cast at the end.
         Used for BOTH storing chunks (add_chunks) and searching (search),
@@ -141,7 +144,7 @@ class StyleMemory:
 
     # ---------- public API: these are the functions other files call ----------
 
-    def add_chunks(self, chunks: list[str], owner: str = DEFAULT_OWNER, source: str = "") -> int:
+    def add_chunks(self, chunks: list[str], owner: str = DEFAULT_OWNER, source: str = "", client=None) -> int:
         """
         Store new writing samples.
 
@@ -150,8 +153,11 @@ class StyleMemory:
             chunks = ingestion.ingest("my_essay.txt")
             memory.add_chunks(chunks, source="my_essay.txt")
 
-        `owner` tags whose writing this is (one shared owner today — see
-        config.DEFAULT_OWNER); `source` records which upload it came from.
+        `owner` tags whose writing this is (the server-key fallback uses
+        config.DEFAULT_OWNER; BYOK users get a hash of their key — see
+        security.owner_for_key); `source` records which upload it came from.
+        `client` is the genai client to embed with — omit it and the server
+        key is used, which is exactly the pre-BYOK behavior.
 
         Steps:
           0. Refuse if this would push the index past MAX_TOTAL_CHUNKS —
@@ -176,14 +182,14 @@ class StyleMemory:
                 f"{remaining} of {MAX_TOTAL_CHUNKS} slots remain."
             )
 
-        vectors = self._embed(chunks)   # step 1
-        self.index.add(vectors)         # step 2
+        vectors = self._embed(chunks, client or get_client())   # step 1
+        self.index.add(vectors)                                 # step 2
         self.entries.extend(            # step 3
             {"text": chunk, "owner": owner, "source": source} for chunk in chunks
         )
         return len(chunks)
 
-    def search(self, query: str, k: int = TOP_K, owner: str | None = None) -> list[str]:
+    def search(self, query: str, k: int = TOP_K, owner: str | None = None, client=None) -> list[str]:
         """
         Find the stored chunks most stylistically similar to `query`.
 
@@ -197,6 +203,8 @@ class StyleMemory:
                 guarantee that one person's prose can't leak into another's
                 voice once there's more than one owner. (With owner=None,
                 everything is searched — correct while there's a single user.)
+                `client` picks which Gemini key embeds the query; omitted, the
+                server key is used (the pre-BYOK behavior).
         Output: a list of the matching ORIGINAL chunk strings (not vectors,
                 not numbers) — exactly what agent.py needs to build its prompt.
 
@@ -209,7 +217,7 @@ class StyleMemory:
 
         # Embed the query the SAME way we embedded the chunks, so they live in
         # the same vector space and are comparable. Note [query] -> a list.
-        query_vector = self._embed([query])
+        query_vector = self._embed([query], client or get_client())
 
         # When filtering by owner, over-fetch: FAISS doesn't know about owners,
         # so we grab every position ranked by similarity and keep the first k

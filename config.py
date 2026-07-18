@@ -49,6 +49,19 @@ if not API_KEY:
     print("WARNING: WRITING_BUDDY_API_KEY is not set. /ingest and /chat will reject all requests.")
 
 # ---------------------------------------------------------------------------
+# BRING-YOUR-OWN-KEY (BYOK)
+# ---------------------------------------------------------------------------
+# When True, /ingest and /chat REQUIRE the X-Gemini-Key header — requests
+# without a user-supplied Gemini key get a 401 instead of falling back to
+# the server's GEMINI_API_KEY above.
+#
+# The rollout plan: leave this False until the extension update that adds
+# the key UI is widely installed, then set REQUIRE_USER_KEY=true in the
+# environment (no code change) to make BYOK mandatory. While False, requests
+# without a key behave exactly as they did before BYOK existed.
+REQUIRE_USER_KEY = os.environ.get("REQUIRE_USER_KEY", "false").strip().lower() in ("1", "true", "yes")
+
+# ---------------------------------------------------------------------------
 # REQUEST LIMITS  (protect the server and the Gemini budget from abuse)
 # ---------------------------------------------------------------------------
 # Hard cap on upload size for /ingest. The endpoint streams the upload and

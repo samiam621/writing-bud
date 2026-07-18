@@ -18,13 +18,14 @@ machines, each one gets its own counter — swap this for a shared store
 (e.g. Redis) at that point.
 """
 
+import hashlib
 import secrets
 import time
 from collections import defaultdict, deque
 
 from fastapi import Header, HTTPException, Request
 
-from config import API_KEY, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
+from config import API_KEY, DEFAULT_OWNER, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +59,34 @@ def require_api_key(x_api_key: str = Header(default="")):
         )
     if not is_valid_key(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+# ---------------------------------------------------------------------------
+# BYOK owner derivation
+# ---------------------------------------------------------------------------
+
+def owner_for_key(gemini_key: str) -> str:
+    """
+    Turn a user's Gemini API key into the `owner` label stamped on their
+    chunks in the FAISS memory (see embeddings.StyleMemory).
+
+    Why a hash: the owner column is persisted to disk in texts.json, and the
+    raw key is a secret that must never be written anywhere. sha256 gives a
+    stable, one-way identifier: the same key always maps to the same owner
+    (so a user always finds their own writing again), but the key can't be
+    recovered from what's stored. 16 hex chars = 64 bits — far beyond any
+    collision risk at this app's scale, and short enough to keep the JSON tidy.
+
+    An empty key (the server-key fallback path) maps to DEFAULT_OWNER — the
+    label every pre-BYOK chunk already carries — so fallback users keep
+    seeing exactly the data they always have.
+
+    NEVER log or store the raw key; this hash is the only derivative of it
+    that may leave process memory.
+    """
+    if not gemini_key:
+        return DEFAULT_OWNER
+    return hashlib.sha256(gemini_key.encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------

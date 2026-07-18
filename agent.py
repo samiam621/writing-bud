@@ -27,22 +27,22 @@ Flow of one turn:
 
 # New official Gemini SDK. Install with: pip install google-genai
 # (The old `google.generativeai` package is deprecated.)
-from google import genai
 from google.genai import types
 
-# All settings (model name, API key) live in config.py — the single source of
-# truth. If config can't be imported, the app can't run, so we let that fail
-# loudly rather than limping along on a stale hardcoded model name.
+# All settings (model name) live in config.py — the single source of truth.
+# If config can't be imported, the app can't run, so we let that fail loudly
+# rather than limping along on a stale hardcoded model name.
 import config
 GENERATION_MODEL = config.GENERATION_MODEL
-GEMINI_API_KEY = config.GEMINI_API_KEY
+
+# Client construction lives in gemini_client.py so a per-user key (BYOK) and
+# the server key go through the same cached factory. get_client() with no
+# argument returns the server-key client — the pre-BYOK behavior.
+from gemini_client import get_client
 
 # The retrieval memory. This is the ONLY link to embeddings/FAISS, and it
 # speaks in plain strings — agent.py stays blissfully unaware of vectors.
 from embeddings import memory
-
-# One reusable client, created when this module loads.
-client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ def build_prompt(user_request: str, style_chunks: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # THE MAIN ENTRY POINT — retrieve, build, generate
 # ---------------------------------------------------------------------------
-def generate(user_request: str) -> str:
+def generate(user_request: str, owner: str | None = None, client=None) -> str:
     """
     Produce a reply written in the user's style.
 
@@ -147,13 +147,25 @@ def generate(user_request: str) -> str:
         from agent import generate
         reply = generate("write a birthday message for my coworker")
 
+    BYOK parameters (both optional — omit them and you get the pre-BYOK
+    behavior exactly):
+        owner  - only retrieve style chunks tagged with this owner, so one
+                 user's prose never colors another user's voice. None means
+                 search everything (right for single-user/local use).
+        client - the genai client (and therefore the API key) that pays for
+                 the calls. None means the server key via get_client().
+
     Steps:
       1. Ask embeddings for the most stylistically relevant chunks.
       2. Build the full prompt from those chunks + the request.
       3. Send it to Gemini and return the text.
     """
+    # Resolve the client ONCE so retrieval and generation are guaranteed to
+    # bill the same key — half-and-half would be a confusing quota mystery.
+    client = client or get_client()
+
     # 1. Retrieve style. memory.search returns list[str]; agent never sees FAISS.
-    style_chunks = memory.search(user_request)
+    style_chunks = memory.search(user_request, owner=owner, client=client)
 
     # 2. Build the per-request part of the prompt (examples + request).
     prompt = build_prompt(user_request, style_chunks)
@@ -171,7 +183,8 @@ def generate(user_request: str) -> str:
 # ---------------------------------------------------------------------------
 # OPTIONAL next step: multi-turn chat with memory of the conversation
 # ---------------------------------------------------------------------------
-def chat(user_request: str, history: list[dict] | None = None) -> str:
+def chat(user_request: str, history: list[dict] | None = None,
+         owner: str | None = None, client=None) -> str:
     """
     Same idea as generate(), but also feeds prior turns so the conversation
     has continuity (useful once you build the chat extension).
@@ -180,9 +193,13 @@ def chat(user_request: str, history: list[dict] | None = None) -> str:
         [{"role": "user", "content": "..."},
          {"role": "assistant", "content": "..."}]
 
+    owner/client work exactly as in generate() — omit both for the
+    single-user, server-key behavior.
+
     You can flesh this out later; generate() is enough to get the agent working.
     """
-    style_chunks = memory.search(user_request)
+    client = client or get_client()
+    style_chunks = memory.search(user_request, owner=owner, client=client)
     prompt = build_prompt(user_request, style_chunks)
 
     # Prepend a simple text transcript of the history so the model has context.

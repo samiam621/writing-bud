@@ -27,6 +27,7 @@ import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
+from typing import NamedTuple
 
 from fastapi import Depends, FastAPI, Header, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,9 +39,12 @@ from ingestion import ingest
 from embeddings import memory, MemoryFullError
 from agent import generate
 
+# BYOK: the cached client factory and the "was it the key's fault?" test.
+from gemini_client import get_client, is_auth_error
+
 # The guards (see security.py) and the limits they enforce (see config.py).
-from security import require_api_key, rate_limit, is_valid_key
-from config import MAX_UPLOAD_BYTES, MAX_MESSAGE_CHARS, ALLOWED_UPLOAD_EXTENSIONS
+from security import require_api_key, rate_limit, is_valid_key, owner_for_key
+from config import MAX_UPLOAD_BYTES, MAX_MESSAGE_CHARS, ALLOWED_UPLOAD_EXTENSIONS, REQUIRE_USER_KEY
 
 # Errors get logged HERE, in full, with tracebacks — and only here. What goes
 # back over HTTP is a generic message. str(some_exception) from pypdf/faiss/
@@ -96,6 +100,64 @@ class ChatRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# BYOK: resolve which Gemini key (and which data namespace) a request uses
+# ---------------------------------------------------------------------------
+class GeminiContext(NamedTuple):
+    """Everything downstream code needs to know about the caller's key,
+    resolved ONCE per request by gemini_context() below."""
+    client: object   # the genai client to bill this request's Gemini calls to
+    owner: str       # namespace for FAISS chunks (hash of the key, or "default")
+    user_supplied: bool  # True when the caller brought their own key
+
+
+def gemini_context(x_gemini_key: str = Header(default="")) -> GeminiContext:
+    """
+    FastAPI dependency: read the optional X-Gemini-Key header and turn it
+    into a (client, owner, user_supplied) triple.
+
+    Three cases:
+      - Header present  -> the user's own key pays; their chunks live under
+                           a hashed owner label so nobody else can search them.
+      - Header absent   -> the server key pays and owner is "default" — the
+                           exact pre-BYOK behavior, kept as a fallback.
+      - Header absent + REQUIRE_USER_KEY=true (config.py) -> 401. This is the
+        switch that makes BYOK mandatory once the extension update is out.
+
+    The raw key is passed straight into the cached client factory and then
+    dropped — it is never stored, logged, or echoed back.
+    """
+    x_gemini_key = x_gemini_key.strip()
+    if REQUIRE_USER_KEY and not x_gemini_key:
+        raise HTTPException(
+            status_code=401,
+            detail="This server requires your own Gemini API key. Add it in the extension's settings.",
+        )
+    return GeminiContext(
+        client=get_client(x_gemini_key or None),
+        owner=owner_for_key(x_gemini_key),
+        user_supplied=bool(x_gemini_key),
+    )
+
+
+def _rejected_key_response(exc: Exception, ctx: GeminiContext) -> HTTPException | None:
+    """
+    If `exc` is Gemini rejecting a USER-supplied key, return the 401 the
+    caller should raise; otherwise None (meaning: not the key's fault, let
+    the endpoint's normal error handling run).
+
+    Only fires for user-supplied keys on purpose: if the SERVER key is bad,
+    that's our misconfiguration — the client can't fix it, so they should
+    see the generic 5xx, and the truth goes to the log as always.
+    """
+    if ctx.user_supplied and is_auth_error(exc):
+        return HTTPException(
+            status_code=401,
+            detail="Your Gemini API key was rejected. Check it and try again.",
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # GET /health  — a heartbeat
 # ---------------------------------------------------------------------------
 @app.get("/health", dependencies=[Depends(rate_limit)])
@@ -121,7 +183,11 @@ def health(x_api_key: str = Header(default="")):
 # POST /ingest  — upload a writing sample
 # ---------------------------------------------------------------------------
 @app.post("/ingest", dependencies=[Depends(require_api_key), Depends(rate_limit)])
-async def ingest_file(request: Request, file: UploadFile = File(...)):
+async def ingest_file(
+    request: Request,
+    file: UploadFile = File(...),
+    ctx: GeminiContext = Depends(gemini_context),
+):
     """
     Receives an uploaded file, turns it into chunks, and stores them.
 
@@ -130,6 +196,10 @@ async def ingest_file(request: Request, file: UploadFile = File(...)):
           -> ingestion.ingest(path)   -> list[str] chunks
           -> memory.add_chunks(chunks) -> stored in FAISS
           -> memory.save()             -> persisted to disk
+
+    BYOK: `ctx` (resolved from the X-Gemini-Key header) decides which key
+    pays for the embeddings and which owner label the chunks are stored
+    under. No header -> server key + "default" owner, same as always.
 
     Returns how many chunks were stored.
     """
@@ -177,7 +247,12 @@ async def ingest_file(request: Request, file: UploadFile = File(...)):
                 tmp.write(chunk)
 
         chunks = ingest(tmp_path)          # read + clean + chunk
-        added = memory.add_chunks(chunks, source=file.filename or "upload")
+        added = memory.add_chunks(
+            chunks,
+            owner=ctx.owner,
+            source=file.filename or "upload",
+            client=ctx.client,
+        )
         memory.save()                      # persist so it survives a restart
 
     except HTTPException:
@@ -195,7 +270,11 @@ async def ingest_file(request: Request, file: UploadFile = File(...)):
         # paths or library internals — that stays in the log.
         logger.exception("Failed to parse upload %r", file.filename)
         raise HTTPException(status_code=400, detail="Could not read that file — is it a valid document?")
-    except Exception:
+    except Exception as exc:
+        # A rejected USER key is the one failure the caller can actually fix,
+        # so it gets its own clear 401 instead of the generic 500 below.
+        if rejected := _rejected_key_response(exc, ctx):
+            raise rejected
         # Anything else (faiss, the embedding API, disk) — same rule: full
         # traceback to the log, a generic 500 to the client.
         logger.exception("Ingest failed for upload %r", file.filename)
@@ -212,17 +291,25 @@ async def ingest_file(request: Request, file: UploadFile = File(...)):
 # POST /chat  — get a reply in the user's voice
 # ---------------------------------------------------------------------------
 @app.post("/chat", dependencies=[Depends(require_api_key), Depends(rate_limit)])
-def chat_endpoint(request: ChatRequest):
+def chat_endpoint(request: ChatRequest, ctx: GeminiContext = Depends(gemini_context)):
     """
     Takes {"message": "..."} and returns {"reply": "..."}.
 
     All the real work — retrieving style chunks and calling Gemini — happens
     inside agent.generate(). This endpoint just hands the message over and
     wraps the result in JSON.
+
+    BYOK: `ctx` decides which key pays and which owner's chunks are searched.
+    Passing ctx.owner explicitly (even for the "default" fallback) is the
+    isolation guarantee in both directions — BYOK users only see their own
+    style, and fallback users never see BYOK users' chunks either.
     """
     try:
-        reply = generate(request.message)
-    except Exception:
+        reply = generate(request.message, owner=ctx.owner, client=ctx.client)
+    except Exception as exc:
+        # A rejected USER key gets a clear, fixable 401 (see the helper).
+        if rejected := _rejected_key_response(exc, ctx):
+            raise rejected
         # Same policy as /ingest: the full error (often a genai exception
         # that names models, quotas, or internals) goes to the log; the
         # client gets a category. 502 = "the upstream service failed us."
