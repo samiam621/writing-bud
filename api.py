@@ -43,7 +43,7 @@ from agent import generate
 from gemini_client import get_client, is_auth_error
 
 # The guards (see security.py) and the limits they enforce (see config.py).
-from security import require_api_key, rate_limit, is_valid_key, owner_for_key
+from security import require_api_key, rate_limit, rate_limit_key, is_valid_key, owner_for_key
 from config import MAX_UPLOAD_BYTES, MAX_MESSAGE_CHARS, ALLOWED_UPLOAD_EXTENSIONS, REQUIRE_USER_KEY
 
 # Errors get logged HERE, in full, with tracebacks — and only here. What goes
@@ -182,7 +182,7 @@ def health(x_api_key: str = Header(default="")):
 # ---------------------------------------------------------------------------
 # POST /ingest  — upload a writing sample
 # ---------------------------------------------------------------------------
-@app.post("/ingest", dependencies=[Depends(require_api_key), Depends(rate_limit)])
+@app.post("/ingest", dependencies=[Depends(require_api_key), Depends(rate_limit), Depends(rate_limit_key)])
 async def ingest_file(
     request: Request,
     file: UploadFile = File(...),
@@ -290,7 +290,7 @@ async def ingest_file(
 # ---------------------------------------------------------------------------
 # POST /chat  — get a reply in the user's voice
 # ---------------------------------------------------------------------------
-@app.post("/chat", dependencies=[Depends(require_api_key), Depends(rate_limit)])
+@app.post("/chat", dependencies=[Depends(require_api_key), Depends(rate_limit), Depends(rate_limit_key)])
 def chat_endpoint(request: ChatRequest, ctx: GeminiContext = Depends(gemini_context)):
     """
     Takes {"message": "..."} and returns {"reply": "..."}.
@@ -316,3 +316,37 @@ def chat_endpoint(request: ChatRequest, ctx: GeminiContext = Depends(gemini_cont
         logger.exception("Generation failed")
         raise HTTPException(status_code=502, detail="Generation failed. Try again in a moment.")
     return {"reply": reply}
+
+
+# ---------------------------------------------------------------------------
+# POST /validate-key  — "does this Gemini key actually work?"
+# ---------------------------------------------------------------------------
+@app.post("/validate-key", dependencies=[Depends(require_api_key), Depends(rate_limit), Depends(rate_limit_key)])
+def validate_key(ctx: GeminiContext = Depends(gemini_context)):
+    """
+    Lets the extension check a key BEFORE saving it, so the user finds out
+    "that key doesn't work" at paste time — not later, mid-upload.
+
+    The check: list the models the key can see. It's the cheapest authentic
+    call there is — no tokens are generated, but Gemini still has to accept
+    the key to answer. A format check alone can't do this; only Gemini knows
+    which keys are real.
+
+    Returns {"valid": true/false} with 200 in both cases — a wrong key is a
+    normal, expected answer here, not an HTTP error. (Contrast /chat, where
+    a rejected key IS an error because work was requested.) Other failures —
+    network, quota, Gemini down — stay 502 so the popup can say "couldn't
+    check" instead of wrongly claiming the key is bad.
+    """
+    if not ctx.user_supplied:
+        raise HTTPException(status_code=400, detail="Send the key to check in the X-Gemini-Key header.")
+    try:
+        # next() forces exactly one page of the listing — proof the key is
+        # accepted — without paging through the full catalog.
+        next(iter(ctx.client.models.list()), None)
+    except Exception as exc:
+        if is_auth_error(exc):
+            return {"valid": False}
+        logger.exception("Key validation failed for a non-auth reason")
+        raise HTTPException(status_code=502, detail="Couldn't check the key right now. Try again in a moment.")
+    return {"valid": True}

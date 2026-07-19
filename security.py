@@ -25,7 +25,14 @@ from collections import defaultdict, deque
 
 from fastapi import Header, HTTPException, Request
 
-from config import API_KEY, DEFAULT_OWNER, RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
+from config import (
+    API_KEY,
+    DEFAULT_OWNER,
+    RATE_LIMIT_REQUESTS,
+    RATE_LIMIT_WINDOW_SECONDS,
+    RATE_LIMIT_KEY_REQUESTS,
+    RATE_LIMIT_KEY_WINDOW_SECONDS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,12 +100,51 @@ def owner_for_key(gemini_key: str) -> str:
 # Rate limiting
 # ---------------------------------------------------------------------------
 
-# ip -> deque of request timestamps (monotonic seconds) inside the window.
+# Rate limiting is HYBRID (see config.py): a generous per-IP window on every
+# endpoint (the volumetric layer) plus a strict per-credential window on the
+# endpoints that spend Gemini quota (the authentication layer). Both layers
+# share one sliding-window implementation, _check_window; they differ only in
+# which TABLE they count in and what a "bucket" means.
+
+# Layer 1 table: ip -> deque of request timestamps (monotonic seconds).
 _hits: dict[str, deque] = defaultdict(deque)
 
-# If the table ever collects this many distinct IPs (a scan/flood), prune the
-# stale ones so the limiter itself can't be used to exhaust memory.
+# Layer 2 table: credential bucket -> deque of request timestamps. Kept
+# separate from _hits so the two windows can't interfere with each other.
+_key_hits: dict[str, deque] = defaultdict(deque)
+
+# If a table ever collects this many distinct buckets (a scan/flood), prune
+# the stale ones so the limiter itself can't be used to exhaust memory.
 _MAX_TRACKED_IPS = 10_000
+
+
+def _check_window(table: dict[str, deque], bucket: str, limit: int, window: float) -> None:
+    """
+    One sliding-window check: 429 if `bucket` already has `limit` timestamps
+    inside the last `window` seconds in `table`; otherwise record this hit.
+
+    Shared by both layers so the algorithm (and its prune guard) lives once.
+    """
+    now = time.monotonic()
+    hits = table[bucket]
+
+    # Drop timestamps that have aged out of the window.
+    while hits and now - hits[0] > window:
+        hits.popleft()
+
+    if len(hits) >= limit:
+        retry_after = int(window - (now - hits[0])) + 1
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests — slow down and try again shortly.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    hits.append(now)
+
+    if len(table) > _MAX_TRACKED_IPS:
+        for tracked in [k for k, v in table.items() if not v or now - v[-1] > window]:
+            del table[tracked]
 
 
 def _client_ip(request: Request) -> str:
@@ -121,27 +167,31 @@ def _client_ip(request: Request) -> str:
 
 def rate_limit(request: Request):
     """
-    FastAPI dependency: 429 if this IP has already made RATE_LIMIT_REQUESTS
-    requests within the last RATE_LIMIT_WINDOW_SECONDS.
+    Layer 1 (volumetric) dependency: 429 if this IP has already made
+    RATE_LIMIT_REQUESTS requests within the last RATE_LIMIT_WINDOW_SECONDS.
+    Attached to every endpoint, including /health.
     """
-    now = time.monotonic()
-    ip = _client_ip(request)
-    hits = _hits[ip]
+    _check_window(_hits, _client_ip(request), RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_SECONDS)
 
-    # Drop timestamps that have aged out of the window.
-    while hits and now - hits[0] > RATE_LIMIT_WINDOW_SECONDS:
-        hits.popleft()
 
-    if len(hits) >= RATE_LIMIT_REQUESTS:
-        retry_after = int(RATE_LIMIT_WINDOW_SECONDS - (now - hits[0])) + 1
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests — slow down and try again shortly.",
-            headers={"Retry-After": str(retry_after)},
-        )
+def rate_limit_key(request: Request, x_gemini_key: str = Header(default="")):
+    """
+    Layer 2 (authentication) dependency: a strict budget per CREDENTIAL on
+    the endpoints that spend Gemini quota. 429 after RATE_LIMIT_KEY_REQUESTS
+    requests in RATE_LIMIT_KEY_WINDOW_SECONDS from the same credential.
 
-    hits.append(now)
+    Bucket choice is the whole point:
+      - BYOK caller  -> bucket = hash of their Gemini key. Rotating IPs
+        doesn't help an abuser; the budget follows the key.
+      - Fallback caller (no key) -> bucket = their IP, but counted in THIS
+        window, not layer 1's. Why not one shared "default" bucket? All
+        fallback users would then split a single 10/min budget, and one
+        noisy neighbor would starve everyone. Per-IP keeps them separate
+        until REQUIRE_USER_KEY makes the fallback path go away entirely.
 
-    if len(_hits) > _MAX_TRACKED_IPS:
-        for tracked_ip in [k for k, v in _hits.items() if not v or now - v[-1] > RATE_LIMIT_WINDOW_SECONDS]:
-            del _hits[tracked_ip]
+    Only the sha256-derived bucket label ever touches the table — the raw
+    key is never stored (same rule as owner_for_key).
+    """
+    x_gemini_key = x_gemini_key.strip()
+    bucket = f"key:{owner_for_key(x_gemini_key)}" if x_gemini_key else f"ip:{_client_ip(request)}"
+    _check_window(_key_hits, bucket, RATE_LIMIT_KEY_REQUESTS, RATE_LIMIT_KEY_WINDOW_SECONDS)

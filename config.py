@@ -73,11 +73,21 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB — generous for a writing sample
 # Prompt cost scales with input size; this keeps one request's cost bounded.
 MAX_MESSAGE_CHARS = 4000
 
-# Simple per-IP rate limit shared by all endpoints: at most RATE_LIMIT_REQUESTS
-# requests per RATE_LIMIT_WINDOW_SECONDS from one client IP. Even with a valid
-# (or leaked) key, one client can't hammer the API in a tight loop.
+# Rate limiting is HYBRID — two layers that catch different attacks:
+#
+#   Layer 1 (per-IP, all endpoints): the volumetric layer. Stops one machine
+#   from hammering the API in a tight loop, regardless of what keys it holds.
+#   Generous, because several legitimate requests per minute is normal use.
 RATE_LIMIT_REQUESTS = 20
 RATE_LIMIT_WINDOW_SECONDS = 60
+
+#   Layer 2 (per-credential, expensive endpoints only): the authentication
+#   layer. /chat and /ingest each cost real Gemini quota, so every credential
+#   gets a strict budget. The bucket follows the CREDENTIAL, not the IP — an
+#   attacker rotating IPs through a VPN/botnet still shares one bucket as
+#   long as they present the same key. Stricter than layer 1 on purpose.
+RATE_LIMIT_KEY_REQUESTS = 10
+RATE_LIMIT_KEY_WINDOW_SECONDS = 60
 
 # The only file types /ingest will accept. Checked BEFORE the upload is written
 # anywhere, so bytes of any other type never touch the disk. Must stay in sync
