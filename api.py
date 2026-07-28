@@ -319,6 +319,43 @@ def chat_endpoint(request: ChatRequest, ctx: GeminiContext = Depends(gemini_cont
 
 
 # ---------------------------------------------------------------------------
+# DELETE /memory  — "forget me": clear the caller's stored writing
+# ---------------------------------------------------------------------------
+@app.delete("/memory", dependencies=[Depends(require_api_key), Depends(rate_limit), Depends(rate_limit_key)])
+def forget_me(ctx: GeminiContext = Depends(gemini_context)):
+    """
+    Deletes every chunk stored under the caller's owner and reports the count.
+
+    Scoping is automatic and safe: `ctx.owner` is derived purely from the
+    caller's Gemini key (security.owner_for_key), so a request can only ever
+    delete data it could itself have created — there is no way to name someone
+    else's namespace. No admin override, no owner parameter: that keeps the
+    shared X-API-Key from becoming a master delete key.
+
+    Unlike /ingest and /chat this does NOT spend Gemini quota — the vectors are
+    reconstructed from the local FAISS index, so no key is billed and a rejected
+    key is impossible here (the header only decides WHICH owner is cleared).
+
+    Note on the `default` namespace: with REQUIRE_USER_KEY=true, gemini_context
+    rejects a keyless request before we run, so `default` can't be reached this
+    way. To clear it, temporarily set REQUIRE_USER_KEY=false, call this with no
+    X-Gemini-Key header, then turn it back on.
+
+    Returns {"deleted_chunks": N}. N=0 (a clean 200) when the owner had nothing
+    stored — deleting is idempotent, not an error.
+    """
+    try:
+        removed = memory.delete_owner(ctx.owner)
+    except Exception:
+        # delete_owner rebuilds the index and writes to disk; a failure there
+        # (faiss, or the filesystem) is ours, not the caller's. Full traceback
+        # to the log, a generic category to the client — same policy as above.
+        logger.exception("Memory deletion failed")
+        raise HTTPException(status_code=500, detail="Couldn't clear your data. Try again in a moment.")
+    return {"deleted_chunks": removed}
+
+
+# ---------------------------------------------------------------------------
 # POST /validate-key  — "does this Gemini key actually work?"
 # ---------------------------------------------------------------------------
 @app.post("/validate-key", dependencies=[Depends(require_api_key), Depends(rate_limit), Depends(rate_limit_key)])

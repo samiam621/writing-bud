@@ -13,9 +13,7 @@ Rule of thumb: if a value is a "magic number" or a secret, it belongs in config.
 
 import os
 
-# Load variables from a .env file into the environment. WITHOUT this, Python
-# never reads .env on its own — os.environ would only see shell-exported vars.
-# Requires: pip install python-dotenv
+# Load variables from a .env file into the environment. 
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -27,14 +25,9 @@ load_dotenv()
 # GEMINI_API_KEY in .env and here is the tidier convention, but either works
 # as long as the two names match.)
 #
-# Example .env line:
-#     geminiAPI="your-key-here"
-#
-# The second argument to os.environ.get is a fallback ("") if it's not set.
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Fail loudly and early if the key is missing, instead of getting a confusing
-# error later from deep inside the Gemini library.
 if not GEMINI_API_KEY:
     print("WARNING: GEMINI_API_KEY is not set. Set it before making API calls.")
 
@@ -48,17 +41,7 @@ API_KEY = os.environ.get("WRITING_BUDDY_API_KEY", "")
 if not API_KEY:
     print("WARNING: WRITING_BUDDY_API_KEY is not set. /ingest and /chat will reject all requests.")
 
-# ---------------------------------------------------------------------------
-# BRING-YOUR-OWN-KEY (BYOK)
-# ---------------------------------------------------------------------------
-# When True, /ingest and /chat REQUIRE the X-Gemini-Key header — requests
-# without a user-supplied Gemini key get a 401 instead of falling back to
-# the server's GEMINI_API_KEY above.
-#
-# The rollout plan: leave this False until the extension update that adds
-# the key UI is widely installed, then set REQUIRE_USER_KEY=true in the
-# environment (no code change) to make BYOK mandatory. While False, requests
-# without a key behave exactly as they did before BYOK existed.
+
 REQUIRE_USER_KEY = os.environ.get("REQUIRE_USER_KEY", "false").strip().lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------

@@ -245,6 +245,57 @@ class StyleMemory:
                 break
         return results
 
+    def delete_owner(self, owner: str) -> int:
+        """
+        Drop every chunk belonging to `owner` and return how many were removed.
+
+        This is the engine behind the "forget me" / re-upload flow: a user
+        (identified by the hash of their Gemini key — see security.owner_for_key)
+        clears their own stored writing. It's also how the leftover `default`
+        chunks get cleaned up.
+
+        How it works WITHOUT re-embedding: IndexFlatIP stores the raw vectors,
+        so faiss lets us read them straight back with reconstruct_n(). We keep
+        the survivors, rebuild a fresh index from just those vectors, and swap
+        it in. No Gemini calls, no API key needed — and the vectors were already
+        unit-normalized when we added them, so they're still valid as-is.
+
+        Why rebuild instead of faiss remove_ids: remove_ids renumbers the
+        remaining vectors, which would silently desync them from self.entries
+        (the parallel list whose positions MUST match the index). Rebuilding
+        both from the same keep-mask keeps them provably in lockstep — the whole
+        invariant this class exists to protect.
+
+        Caller is responsible for nothing extra: we persist the result with
+        save() before returning, so a crash right after can't leave disk holding
+        data we just told the user was deleted.
+        """
+        # A boolean per entry: True = keep. Its length equals self.index.ntotal
+        # because entries and the index are always added in lockstep.
+        keep_mask = [entry["owner"] != owner for entry in self.entries]
+        removed = keep_mask.count(False)
+
+        # Nothing matched — don't touch the index or rewrite disk for a no-op.
+        if removed == 0:
+            return 0
+
+        # Read back every stored vector (shape: ntotal x EMBED_DIM), then keep
+        # only the rows we're not deleting. reconstruct_n(start, count) is the
+        # bulk form; IndexFlatIP supports it because it holds the raw vectors.
+        new_index = faiss.IndexFlatIP(EMBED_DIM)
+        if any(keep_mask):
+            all_vectors = self.index.reconstruct_n(0, self.index.ntotal)
+            new_index.add(all_vectors[np.array(keep_mask)])
+
+        # Swap in the rebuilt pair together so they can never drift apart.
+        self.index = new_index
+        self.entries = [entry for entry, keep in zip(self.entries, keep_mask) if keep]
+
+        # Persist immediately: the delete isn't "real" until it survives a
+        # restart, and load() reads both files, so we save() both here.
+        self.save()
+        return removed
+
     # ---------- persistence: so users don't re-upload every session ----------
 
     def save(self) -> None:
