@@ -9,7 +9,7 @@ Most AI writing tools make everything sound like... AI. Writing Buddy is differe
 1. You give Buddy a few pieces of your own writing (emails, essays, notes — anything).
 2. Buddy reads them and remembers *how* you write.
 3. Later, when you ask it to write something new or rewrite something on a webpage, it pulls up the parts of your past writing that are most similar to what you're asking for, and uses them as a style reference.
-4. Gemini (Google's AI) then writes new content in that style — it imitates your *voice*, but never copies your old sentences or facts word-for-word.
+4. Buddy then writes new content in that style — it imitates your *voice*, but never copies your old sentences or facts word-for-word.
 
 ## Getting started
 
